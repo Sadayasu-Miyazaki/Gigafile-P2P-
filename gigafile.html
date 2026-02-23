@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gigafile</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 12px; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    .box { border: 1px solid #000; padding: 10px; margin: 10px 0; }
+    .row { margin: 6px 0; }
+    textarea { width: 100%; height: 110px; }
+    input[type="text"] { width: 100%; }
+    button { padding: 6px 10px; margin-right: 6px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .small { font-size: 12px; }
+    progress { width: 100%; height: 18px; }
+    video { width: 100%; max-height: 60vh; background: #000; }
+    .warn { background: #fff3cd; border: 1px solid #000; padding: 8px; }
+    .ok { background: #d1ffd1; border: 1px solid #000; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h1>P2P 動画送受信（WebRTC / 手動ペアリング）</h1>
+
+  <div class="warn small">
+    ・このページはサーバー無しで動きます（相手と「接続文字列」をコピペで交換）。<br>
+    ・環境によってはP2P接続が成立しないことがあります（TURNなしのため）。<br>
+    ・受信側は受け取った動画サイズ分のメモリを使います（巨大ファイルは厳しい場合あり）。
+  </div>
+
+  <div class="box">
+    <div class="row"><b>状態</b></div>
+    <div id="status" class="mono">idle</div>
+    <div class="row small">あなたの役割：<span id="role" class="mono">未選択</span></div>
+  </div>
+
+  <div class="box">
+    <div class="row"><b>① 送信側（動画を送る）</b></div>
+
+    <div class="row small">
+      1) 動画を選択 → 2)「オファー作成」→ 出た文字列を相手へ送る →<br>
+      3) 相手から返ってきた「回答」を貼って「回答を適用」→ 4) 接続できたら送信開始
+    </div>
+
+    <div class="row">
+      <input id="fileInput" type="file" accept="video/*" />
+    </div>
+
+    <div class="row">
+      <button id="btnMakeOffer">オファー作成（送信側）</button>
+      <button id="btnApplyAnswer" disabled>回答を適用（送信側）</button>
+      <button id="btnSendFile" disabled>送信開始</button>
+    </div>
+
+    <div class="row small">送信側：相手へ送る文字列（オファー）</div>
+    <textarea id="offerOut" class="mono" readonly></textarea>
+
+    <div class="row small">送信側：相手から返ってきた文字列（回答）を貼る</div>
+    <textarea id="answerIn" class="mono" placeholder="相手から届いた回答を貼り付け"></textarea>
+
+    <div class="row">
+      <div class="small">送信進捗</div>
+      <progress id="sendProg" value="0" max="1"></progress>
+      <div id="sendInfo" class="mono small">-</div>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="row"><b>② 受信側（動画を受け取って再生）</b></div>
+
+    <div class="row small">
+      1) 相手から届いた「オファー」を貼る → 2)「受け取って回答作成」→ 出た文字列を相手へ返す →<br>
+      3) 接続後に自動で受信。完了したら下で再生できます。
+    </div>
+
+    <div class="row">
+      <button id="btnAcceptOffer">受け取って回答作成（受信側）</button>
+    </div>
+
+    <div class="row small">受信側：相手から届いた文字列（オファー）を貼る</div>
+    <textarea id="offerIn" class="mono" placeholder="相手から届いたオファーを貼り付け"></textarea>
+
+    <div class="row small">受信側：相手へ返す文字列（回答）</div>
+    <textarea id="answerOut" class="mono" readonly></textarea>
+
+    <div class="row">
+      <div class="small">受信進捗</div>
+      <progress id="recvProg" value="0" max="1"></progress>
+      <div id="recvInfo" class="mono small">-</div>
+    </div>
+
+    <div class="row">
+      <div class="small">受信した動画（受信完了後に再生）</div>
+      <video id="video" controls></video>
+      <div class="small mono" id="videoInfo">-</div>
+    </div>
+  </div>
+
+  <div class="box small">
+    <b>使い方（超短縮）</b><br>
+    <ol>
+      <li>送信側：動画選択 → 「オファー作成」→ 出た文字列を相手へ</li>
+      <li>受信側：その文字列を貼る → 「受け取って回答作成」→ 出た文字列を送信側へ</li>
+      <li>送信側：回答を貼る → 「回答を適用」→ 「送信開始」</li>
+      <li>受信側：受信完了後、動画プレイヤーで再生</li>
+    </ol>
+  </div>
+
+<script>
+(() => {
+  // ====== UI helpers ======
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status");
+  const roleEl = $("role");
+  const setStatus = (s) => statusEl.textContent = s;
+
+  // ====== WebRTC setup ======
+  // STUN only (no TURN). TURN requires a server and credentials.
+  const rtcConfig = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" }
+    ]
+  };
+
+  let pc = null;
+  let dc = null;
+
+  // sending
+  let sendingFile = null;
+  let sendAbort = false;
+
+  // receiving
+  let recvMeta = null;
+  let recvBuffers = [];
+  let recvBytes = 0;
+
+  // We pack everything into one JSON "signal" after ICE gathering completes.
+  async function waitIceGatheringComplete(peer) {
+    if (peer.iceGatheringState === "complete") return;
+    await new Promise((resolve) => {
+      const check = () => {
+        if (peer.iceGatheringState === "complete") {
+          peer.removeEventListener("icegatheringstatechange", check);
+          resolve();
+        }
+      };
+      peer.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  function makePeerConnection() {
+    if (pc) {
+      try { pc.close(); } catch {}
+    }
+    pc = new RTCPeerConnection(rtcConfig);
+
+    pc.onconnectionstatechange = () => {
+      setStatus("pc.connectionState = " + pc.connectionState);
+    };
+    pc.oniceconnectionstatechange = () => {
+      // Useful for debugging connectivity
+      // console.log("iceConnectionState", pc.iceConnectionState);
+    };
+
+    pc.ondatachannel = (ev) => {
+      dc = ev.channel;
+      setupDataChannel();
+    };
+
+    return pc;
+  }
+
+  function setupDataChannel() {
+    if (!dc) return;
+
+    dc.binaryType = "arraybuffer";
+
+    dc.onopen = () => {
+      setStatus("DataChannel open");
+      // Enable send if we are sender and have file
+      $("btnSendFile").disabled = !(sendingFile && dc.readyState === "open");
+    };
+
+    dc.onclose = () => {
+      setStatus("DataChannel closed");
+      $("btnSendFile").disabled = true;
+    };
+
+    dc.onerror = (e) => {
+      setStatus("DataChannel error: " + (e && e.message ? e.message : "unknown"));
+    };
+
+    dc.onmessage = (ev) => {
+      handleIncoming(ev.data);
+    };
+  }
+
+  // ====== Signaling encode/decode ======
+  function encodeSignal(desc) {
+    // desc: RTCSessionDescriptionInit (offer/answer)
+    // pc.localDescription includes SDP; ICE candidates are inside SDP once gathering complete.
+    const obj = { type: desc.type, sdp: desc.sdp };
+    const json = JSON.stringify(obj);
+    // Base64 to make it easy to copy (no newlines)
+    const b64 = btoa(unescape(encodeURIComponent(json)));
+    return b64;
+  }
+
+  function decodeSignal(b64) {
+    const json = decodeURIComponent(escape(atob(b64.trim())));
+    const obj = JSON.parse(json);
+    if (!obj || !obj.type || !obj.sdp) throw new Error("invalid signal");
+    return obj;
+  }
+
+  async function setRemoteFromB64(b64) {
+    const obj = decodeSignal(b64);
+    await pc.setRemoteDescription(obj);
+  }
+
+  // ====== File transfer protocol over DataChannel ======
+  // We send:
+  // 1) JSON meta message: {"t":"meta","name":...,"size":...,"type":...}
+  // 2) binary chunks (ArrayBuffer)
+  // 3) JSON end message: {"t":"end"}
+  const CHUNK_SIZE = 64 * 1024; // 64KB
+  const HIGH_WATER_MARK = 8 * 1024 * 1024; // 8MB bufferedAmount threshold
+
+  function sendJson(obj) {
+    dc.send(JSON.stringify(obj));
+  }
+
+  async function sendFile(file) {
+    if (!dc || dc.readyState !== "open") {
+      alert("接続されていません");
+      return;
+    }
+
+    sendAbort = false;
+    const total = file.size;
+    let sent = 0;
+
+    $("sendProg").max = total || 1;
+    $("sendProg").value = 0;
+    $("sendInfo").textContent = "start...";
+
+    sendJson({ t: "meta", name: file.name, size: file.size, mime: file.type || "application/octet-stream" });
+
+    // Flow control using bufferedAmount
+    dc.bufferedAmountLowThreshold = HIGH_WATER_MARK / 2;
+    const waitBufferedLow = () => new Promise((resolve) => {
+      if (dc.bufferedAmount < HIGH_WATER_MARK) return resolve();
+      const onLow = () => {
+        dc.removeEventListener("bufferedamountlow", onLow);
+        resolve();
+      };
+      dc.addEventListener("bufferedamountlow", onLow);
+    });
+
+    while (sent < total) {
+      if (sendAbort) {
+        $("sendInfo").textContent = "aborted";
+        return;
+      }
+
+      const end = Math.min(sent + CHUNK_SIZE, total);
+      const slice = file.slice(sent, end);
+      const buf = await slice.arrayBuffer();
+
+      // If bufferedAmount is too high, wait.
+      if (dc.bufferedAmount >= HIGH_WATER_MARK) {
+        await waitBufferedLow();
+      }
+
+      dc.send(buf);
+      sent = end;
+
+      $("sendProg").value = sent;
+      $("sendInfo").textContent = `${sent} / ${total} bytes`;
+    }
+
+    sendJson({ t: "end" });
+    $("sendInfo").textContent = `done: ${total} bytes`;
+  }
+
+  function handleIncoming(data) {
+    // data: string (JSON) OR ArrayBuffer
+    if (typeof data === "string") {
+      let msg = null;
+      try { msg = JSON.parse(data); } catch { return; }
+      if (!msg || !msg.t) return;
+
+      if (msg.t === "meta") {
+        recvMeta = msg;
+        recvBuffers = [];
+        recvBytes = 0;
+
+        $("recvProg").max = recvMeta.size || 1;
+        $("recvProg").value = 0;
+        $("recvInfo").textContent = `meta: ${recvMeta.name} (${recvMeta.size} bytes, ${recvMeta.mime})`;
+        $("video").removeAttribute("src");
+        $("video").load();
+        $("videoInfo").textContent = "-";
+        return;
+      }
+
+      if (msg.t === "end") {
+        finalizeReceive();
+        return;
+      }
+      return;
+    }
+
+    // Binary chunk
+    if (data instanceof ArrayBuffer) {
+      if (!recvMeta) return;
+      recvBuffers.push(new Uint8Array(data));
+      recvBytes += data.byteLength;
+
+      $("recvProg").value = recvBytes;
+      $("recvInfo").textContent = `${recvBytes} / ${recvMeta.size} bytes`;
+      return;
+    }
+  }
+
+  function finalizeReceive() {
+    if (!recvMeta) return;
+
+    try {
+      // Combine to Blob
+      const blob = new Blob(recvBuffers, { type: recvMeta.mime || "video/mp4" });
+      const url = URL.createObjectURL(blob);
+
+      const v = $("video");
+      v.src = url;
+      v.controls = true;
+
+      $("videoInfo").textContent = `received: ${recvMeta.name} (${recvBytes} bytes)`;
+      $("recvInfo").textContent = "done";
+    } catch (e) {
+      $("recvInfo").textContent = "finalize error: " + (e && e.message ? e.message : "unknown");
+    } finally {
+      // Keep buffers (for playback) - if you want to free memory after playback start:
+      // You could keep only the blob URL and clear recvBuffers, but blob still holds data in memory.
+      // recvBuffers = [];
+      // recvMeta = null;
+    }
+  }
+
+  // ====== UI events ======
+  $("fileInput").addEventListener("change", () => {
+    const f = $("fileInput").files && $("fileInput").files[0];
+    sendingFile = f || null;
+    $("btnSendFile").disabled = !(sendingFile && dc && dc.readyState === "open");
+    roleEl.textContent = sendingFile ? "送信側候補" : "未選択";
+  });
+
+  // Sender: create offer
+  $("btnMakeOffer").addEventListener("click", async () => {
+    try {
+      roleEl.textContent = "送信側";
+      setStatus("creating offer...");
+
+      makePeerConnection();
+
+      // Create data channel as sender
+      dc = pc.createDataChannel("file", { ordered: true });
+      setupDataChannel();
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIceGatheringComplete(pc);
+
+      const b64 = encodeSignal(pc.localDescription);
+      $("offerOut").value = b64;
+      $("btnApplyAnswer").disabled = false;
+
+      setStatus("offer ready (copy to receiver)");
+    } catch (e) {
+      setStatus("offer error: " + (e && e.message ? e.message : "unknown"));
+    }
+  });
+
+  // Sender: apply answer
+  $("btnApplyAnswer").addEventListener("click", async () => {
+    try {
+      if (!pc) {
+        alert("先にオファーを作成してください");
+        return;
+      }
+      const b64 = $("answerIn").value.trim();
+      if (!b64) {
+        alert("回答を貼ってください");
+        return;
+      }
+
+      setStatus("applying answer...");
+      await setRemoteFromB64(b64);
+
+      setStatus("answer applied. waiting channel open...");
+      // send button will be enabled when dc.onopen fires
+    } catch (e) {
+      setStatus("apply answer error: " + (e && e.message ? e.message : "unknown"));
+    }
+  });
+
+  // Sender: send file
+  $("btnSendFile").addEventListener("click", async () => {
+    if (!sendingFile) {
+      alert("送る動画を選択してください");
+      return;
+    }
+    if (!dc || dc.readyState !== "open") {
+      alert("接続されていません");
+      return;
+    }
+    await sendFile(sendingFile);
+  });
+
+  // Receiver: accept offer, create answer
+  $("btnAcceptOffer").addEventListener("click", async () => {
+    try {
+      roleEl.textContent = "受信側";
+      const offerB64 = $("offerIn").value.trim();
+      if (!offerB64) {
+        alert("オファーを貼ってください");
+        return;
+      }
+
+      setStatus("accepting offer...");
+      makePeerConnection();
+
+      await setRemoteFromB64(offerB64);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitIceGatheringComplete(pc);
+
+      const b64 = encodeSignal(pc.localDescription);
+      $("answerOut").value = b64;
+
+      setStatus("answer ready (send back to sender)");
+      // DataChannel will arrive via pc.ondatachannel
+    } catch (e) {
+      setStatus("accept offer error: " + (e && e.message ? e.message : "unknown"));
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
